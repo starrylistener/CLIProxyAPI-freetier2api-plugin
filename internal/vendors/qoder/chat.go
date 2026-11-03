@@ -1404,7 +1404,7 @@ func CredentialFingerprint(cred *Credential) string {
 	if cred == nil {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(cred.Token + "|" + cred.RefreshToken + "|" + string(cred.Region)))
+	sum := sha256.Sum256([]byte(cred.Token + "|" + cred.RefreshToken + "|" + string(cred.Region) + "|" + cred.VPCEndpoint))
 	return hex.EncodeToString(sum[:16])
 }
 
@@ -1444,8 +1444,11 @@ func ResolveOAuthUserID(userInfo map[string]interface{}) string {
 	return StrVal(userInfo, "uid")
 }
 
-func FetchUserInfoWithToken(ctx context.Context, token string, region Region) (map[string]interface{}, error) {
-	ep := GetEndpoints(region)
+func FetchUserInfoWithToken(ctx context.Context, token string, region Region, vpcEndpoint ...string) (map[string]interface{}, error) {
+	ep, errEndpoints := resolveEndpoints(region, firstVPCEndpoint(vpcEndpoint))
+	if errEndpoints != nil {
+		return nil, errEndpoints
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", ep.UserinfoBase, nil)
 	if err != nil {
 		return nil, err
@@ -1474,6 +1477,7 @@ type Bridge struct {
 	sess         *SessionContext
 	client       *BearerClient
 	region       Region
+	endpoints    *Endpoints
 	templateBase map[string]interface{}
 	// models 是所属 adapter 实例的模型索引：把对外 slug 还原成上游 key。
 	// 为 nil 时（仅测试可构造）退回内置映射表。
@@ -1503,7 +1507,11 @@ type Model struct {
 //
 // models 是所属 adapter 实例的模型索引，用于出站时把对外 slug 还原成上游 key；
 // 传 nil 时 Bridge 退回内置映射表（尚无索引的测试场景）。
-func NewBridge(ctx context.Context, pat string, region Region, templateBase map[string]interface{}, models *modelIndex) (*Bridge, error) {
+func NewBridge(ctx context.Context, pat string, region Region, templateBase map[string]interface{}, models *modelIndex, vpcEndpoint ...string) (*Bridge, error) {
+	endpoints, errEndpoints := resolveEndpoints(region, firstVPCEndpoint(vpcEndpoint))
+	if errEndpoints != nil {
+		return nil, errEndpoints
+	}
 	// 注意：不要在这里打印凭证（哪怕是前缀）。插件日志会进入 CPA 进程日志，
 	// 账号标识只允许出现在成功建立会话后的非敏感字段里。
 	var identity AuthIdentity
@@ -1511,7 +1519,7 @@ func NewBridge(ctx context.Context, pat string, region Region, templateBase map[
 
 	deviceToken, refreshToken := ParseOAuthSecret(pat)
 	if strings.HasPrefix(deviceToken, "dt-") {
-		userInfo, err := FetchUserInfoWithToken(ctx, deviceToken, region)
+		userInfo, err := FetchUserInfoWithToken(ctx, deviceToken, region, vpcEndpoint...)
 		if err != nil {
 			return nil, fmt.Errorf("fetch user info: %w", err)
 		}
@@ -1531,7 +1539,7 @@ func NewBridge(ctx context.Context, pat string, region Region, templateBase map[
 		// jobToken 交换发生在拿到 uid 之前：机器头用凭证种子稳定派生
 		// （hub 的交换请求不带机器头，此处保留 QCCG 原有行为但消除随机漂移）
 		seed := FingerprintSeed("", pat)
-		jt, err := ExchangeJobToken(ctx, pat, DeriveMachineID(seed), DeriveMachineToken(seed), DeriveMachineType(seed), GetEndpoints(region).JobTokenURL)
+		jt, err := ExchangeJobToken(ctx, pat, DeriveMachineID(seed), DeriveMachineToken(seed), DeriveMachineType(seed), endpoints.JobTokenURL)
 		if err != nil {
 			return nil, fmt.Errorf("exchangeJobToken: %w", err)
 		}
@@ -1564,6 +1572,7 @@ func NewBridge(ctx context.Context, pat string, region Region, templateBase map[
 		sess:         sess,
 		client:       client,
 		region:       region,
+		endpoints:    &endpoints,
 		templateBase: templateBase,
 		models:       models,
 	}, nil
@@ -1573,6 +1582,9 @@ func NewBridge(ctx context.Context, pat string, region Region, templateBase map[
 // 返回顶层 assistant 数组中 enable=true 的模型，按 is_default desc + display_name asc 排序。
 func (b *Bridge) ListAvailableModels(ctx context.Context) ([]Model, error) {
 	modelListURL := qoderModelListURL(b.region)
+	if b.endpoints != nil {
+		modelListURL = b.endpoints.ModelListURL
+	}
 	resp, err := b.client.callGet(ctx, modelListURL)
 	if err != nil {
 		return nil, err
@@ -1797,6 +1809,9 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 	}
 
 	qurl := qoderChatStreamURL(b.region)
+	if b.endpoints != nil {
+		qurl = b.endpoints.ChatStreamURL
+	}
 	if b.chatStreamURL != "" {
 		qurl = b.chatStreamURL
 	}
@@ -2314,6 +2329,77 @@ func GetEndpoints(region Region) Endpoints {
 		return endpointsCN
 	}
 	return endpointsGlobal
+}
+
+const vpcDomainSuffix = ".vpc.qoder.com.cn"
+
+// normalizeVPCEndpoint accepts the instance's HTTPS dashboard URL or hostname.
+// Store only a validated instance host so a malformed enterprise credential never
+// falls back to public hosts or sends credentials to an arbitrary URL.
+func normalizeVPCEndpoint(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if !strings.Contains(value, "://") {
+		value = "https://" + value
+	}
+	u, err := url.Parse(value)
+	if err != nil || u.Scheme != "https" || u.User != nil || u.Port() != "" ||
+		(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return "", fmt.Errorf("企业专属域须为 https://实例名.vpc.qoder.com.cn，不含端口、路径或参数")
+	}
+	host := strings.ToLower(u.Host)
+	if !strings.HasSuffix(host, vpcDomainSuffix) {
+		return "", fmt.Errorf("企业专属域必须属于 vpc.qoder.com.cn")
+	}
+	instance := strings.TrimSuffix(host, vpcDomainSuffix)
+	if len(instance) == 0 || len(instance) > 55 || instance[0] == '-' || instance[len(instance)-1] == '-' ||
+		strings.HasSuffix(instance, "-openapi") || strings.HasSuffix(instance, "-gateway") {
+		return "", fmt.Errorf("请填写企业实例的登录域名，不能填写 OpenAPI 或网关地址")
+	}
+	for _, r := range instance {
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+			return "", fmt.Errorf("企业实例名只能包含字母、数字和连字符")
+		}
+	}
+	return host, nil
+}
+
+func firstVPCEndpoint(values []string) string {
+	if len(values) > 0 {
+		return values[0]
+	}
+	return ""
+}
+
+// resolveEndpoints follows the official CN CLI's base/openapi/gateway mapping.
+func resolveEndpoints(region Region, vpcEndpoint string) (Endpoints, error) {
+	host, err := normalizeVPCEndpoint(vpcEndpoint)
+	if err != nil {
+		return Endpoints{}, err
+	}
+	if host == "" {
+		return GetEndpoints(region), nil
+	}
+	if region != RegionCN {
+		return Endpoints{}, fmt.Errorf("企业 VPC 登录仅支持 Qoder 国内版")
+	}
+	instance := strings.TrimSuffix(host, vpcDomainSuffix)
+	base := "https://" + host
+	openapi := "https://" + instance + "-openapi" + vpcDomainSuffix
+	gateway := "https://" + instance + "-gateway" + vpcDomainSuffix
+	return Endpoints{
+		DeviceLoginBase: base + "/device/selectAccounts",
+		PollEndpoint:    openapi + "/api/v1/deviceToken/poll",
+		UserinfoBase:    openapi + "/api/v1/userinfo",
+		PlanEndpoint:    openapi + "/api/v2/user/plan",
+		QuotaEndpoint:   openapi + "/api/v2/quota/usage",
+		ChatStreamURL:   gateway + "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1",
+		ModelListURL:    gateway + "/algo/api/v2/model/list?Encode=1",
+		JobTokenURL:     gateway + "/algo/api/v3/user/jobToken?Encode=1",
+		SashBase:        openapi,
+	}, nil
 }
 
 // NormalizeRegion 将字符串归一化为合法 Region 值

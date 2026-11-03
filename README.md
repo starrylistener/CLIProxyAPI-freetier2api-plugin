@@ -8,6 +8,8 @@
 
 中文 | [English](README_EN.md)
 
+> **企业 VPC 适配 Fork**：本仓库基于 [cxy2730 的维护版本](https://github.com/cxy2730/CLIProxyAPI-freetier2api-plugin)，新增 Qoder CN 企业专属实例登录。安装包见本仓库的 [Actions](https://github.com/starrylistener/CLIProxyAPI-freetier2api-plugin/actions)；构建成功后下载 `freetier-vpc-packages`，包含 Linux amd64 / arm64、Windows amd64 的 zip 和 `checksums.txt`。包内动态库仍使用插件 ID `freetier`，可覆盖现有安装。
+
 如果这个项目帮到了你，欢迎点个 Star 支持一下。
 
 > **本仓库说明**：上游 `jiandanc/CLIProxyAPI-freetier2api-plugin` 已随作者账号一并从 GitHub 消失（账号与仓库均为 404）。本仓库自 **v0.1.29** 起由 `cxy2730` 接手维护，插件 ID 仍为 `freetier`，已有安装可直接覆盖升级。仓库已从 fork 网络脱离，是独立仓库；完整提交历史保留，`v0.1.44` 及更早的 tag 只存在于归档仓库 `cxy2730/CLIProxyAPI-freetier2api-plugin-legacy`，本仓库从 `v0.1.45` 起继续发版。
@@ -91,6 +93,14 @@ http://<CPA地址>:8317/v0/resource/plugins/freetier/console
 
 - 点击 **「添加账号 ▾」** 选择对应供应商，按提示在浏览器完成 OAuth 授权或填入 API Key（账号数量不设上限）。
 - 若在远程服务器 / Docker / WSL 部署，使用 Trae 或 CodeArts 登录时浏览器停留在 `127.0.0.1` 回调页，展开登录框下方的 **「回调没到插件？粘贴回调链接」**，将完整回调 URL 粘贴提交即可。
+
+#### Qoder CN 企业专属实例（VPC）
+
+使用 CPA **v8.0.49 或更新版本**。控制台选择 **Qoder 国内版**，在「企业专属域」填写管理员提供的登录域名，例如 `acme.vpc.qoder.com.cn`，点击「获取授权链接」，再打开链接完成企业认证。留空使用公共版。
+
+专属域接受实例域名或 `https://实例名.vpc.qoder.com.cn/`，不能填写 `-openapi` / `-gateway` 服务域名。插件按官方 CN CLI 的规则派生账号与模型服务地址，并把 `vpc_endpoint` 保存到该账号的凭证 JSON。续期、额度、模型目录和对话均使用原实例，不受之后新增其他账号影响；同一人的公共账号和不同企业账号使用不同凭证文件名。企业账号暂不支持签到。
+
+CPA 所在机器需能通过 HTTPS 访问实例的登录域名、`实例名-openapi.vpc.qoder.com.cn` 和 `实例名-gateway.vpc.qoder.com.cn`。浏览器可以打开登录页，只能证明浏览器的网络可达，不能替代 CPA 宿主的连通性检查。
 
 ### 2. 调用 API
 

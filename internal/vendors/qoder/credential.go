@@ -71,6 +71,8 @@ type Credential struct {
 	RefreshToken string
 	// Region 是账号所属区域。
 	Region Region
+	// VPCEndpoint binds this credential to its enterprise instance; empty means public cloud.
+	VPCEndpoint string
 	// Label 是展示名。
 	Label string
 	// Email 是账号邮箱（登录流程会填）。
@@ -125,6 +127,20 @@ func ParseCredential(raw []byte, fallbackRegion Region) (*Credential, error) {
 	}
 	if region, okRegion := payload["region"].(string); okRegion && strings.TrimSpace(region) != "" {
 		cred.Region = NormalizeRegion(region)
+	}
+	if rawEndpoint, exists := payload["vpc_endpoint"]; exists {
+		endpoint, okString := rawEndpoint.(string)
+		if !okString {
+			return nil, fmt.Errorf("vpc_endpoint must be a string")
+		}
+		var errEndpoint error
+		cred.VPCEndpoint, errEndpoint = normalizeVPCEndpoint(endpoint)
+		if errEndpoint != nil {
+			return nil, errEndpoint
+		}
+		if _, errEndpoint = resolveEndpoints(cred.Region, cred.VPCEndpoint); errEndpoint != nil {
+			return nil, errEndpoint
+		}
 	}
 	if label, okLabel := payload["label"].(string); okLabel {
 		cred.Label = strings.TrimSpace(label)

@@ -378,6 +378,14 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
 
       <div class="card" id="loginBox" hidden>
         <h2 id="loginTitle">完成授权</h2>
+        <div id="qoderVpcBox" hidden>
+          <label for="qoderVpcEndpoint">企业专属域（可选，留空使用公共版）</label>
+          <div class="row" style="margin:8px 0">
+            <input type="text" id="qoderVpcEndpoint" class="grow"
+                   placeholder="例如 acme.vpc.qoder.com.cn" autocomplete="off">
+            <button class="act primary" id="btnQoderLogin">获取授权链接</button>
+          </div>
+        </div>
         <div class="row" id="loginVariantRow" hidden style="display:none"></div>
         <div class="login-captcha" id="loginCaptcha" hidden></div>
         <div class="row">
@@ -2191,6 +2199,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   // 宿主按路径里的 "<provider>-auth-url" 把请求转给插件的 auth.login.start，
   // 插件完成登录后由宿主把凭证落盘。
   var loginTimer = null;
+  var deviceLoginGeneration = 0;
 
   function stopLoginPolling() {
     if (loginTimer) { clearInterval(loginTimer); loginTimer = null; }
@@ -2206,6 +2215,9 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   // 支持登录的供应商（Cline / WorkBuddy / Qoder）→ 发起设备授权；
   // 纯 API key 的供应商（OpenCode ZEN）→ 展开 API Key 输入框，保存后直写凭证文件。
   function startVendorAdd(vendor) {
+    deviceLoginGeneration++;
+    document.getElementById("qoderVpcBox").hidden = true;
+    document.getElementById("btnQoderLogin").disabled = false;
     var loginBox = document.getElementById("loginBox");
     var apiKeyBox = document.getElementById("apiKeyBox");
     stopLoginPolling();
@@ -2565,6 +2577,9 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     urlField.value = "";
     status.textContent = "正在获取授权链接…";
 
+    var vpcBox = document.getElementById("qoderVpcBox");
+    vpcBox.hidden = !(vendor && vendor.id === "qodercn");
+
     // 粘贴兜底只对「上游只认 localhost 回调」的供应商有意义（Trae / CodeArts）：
     // 别的供应商没有本机回调，展开它只会让人以为可以往这里贴东西。
     var canPaste = !!(vendor && vendor.paste_callback);
@@ -2581,10 +2596,34 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       document.getElementById("btnSubmitCallback").disabled = false;
     }
 
+    if (vendor && vendor.id === "qodercn") {
+      status.textContent = "企业账号请填写专属域，再获取授权链接；公共版可直接获取。";
+      document.getElementById("btnQoderLogin").onclick = function () { requestDeviceLogin(vendor); };
+      return;
+    }
+    requestDeviceLogin(vendor);
+  }
+
+  function requestDeviceLogin(vendor) {
+    var generation = ++deviceLoginGeneration;
+    stopLoginPolling();
+    currentLoginState = "";
+    var status = document.getElementById("loginStatus");
+    var urlField = document.getElementById("loginUrl");
+    var button = document.getElementById("btnQoderLogin");
+    var query = "?vendor=" + encodeURIComponent(vendor.id);
+    if (vendor.id === "qodercn") {
+      query += "&vpc_endpoint=" + encodeURIComponent(document.getElementById("qoderVpcEndpoint").value.trim());
+      button.disabled = true;
+    }
+    status.textContent = "正在获取授权链接…";
+    urlField.value = "";
     // 供应商经 metadata 传给插件：宿主按路径解析 provider（/freetier-auth-url），
     // 插件再按 vendor 参数选具体供应商实例。路径里不能带 vendor——
     // 宿主会把它当成 provider 名去校验，直接 404。
-    api("GET", hostPath("/freetier-auth-url?vendor=" + encodeURIComponent(vendor.id))).then(function (data) {
+    api("GET", hostPath("/freetier-auth-url" + query)).then(function (data) {
+      if (generation !== deviceLoginGeneration) return;
+      button.disabled = false;
       if (!data || !data.url) {
         status.textContent = "获取授权链接失败：" + ((data && data.error) || "响应缺少 url");
         return;
@@ -2595,6 +2634,8 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       currentLoginState = state;
       if (state) pollLogin(state);
     }).catch(function (err) {
+      if (generation !== deviceLoginGeneration) return;
+      button.disabled = false;
       status.textContent = "获取授权链接失败：" + err.message;
     });
   }
@@ -2658,6 +2699,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     }
   });
   document.getElementById("btnLoginCancel").addEventListener("click", function () {
+    deviceLoginGeneration++;
     stopLoginPolling();
     resetLoginCaptcha();
     clearLoginVariants();

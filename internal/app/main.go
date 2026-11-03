@@ -20,7 +20,7 @@ const (
 	pluginID          = "freetier"
 	pluginDisplayName = "FreeTier 2API"
 	pluginAuthor      = "cxy2730"
-	pluginRepository  = "https://github.com/cxy2730/CLIProxyAPI-freetier2api-plugin"
+	pluginRepository  = "https://github.com/starrylistener/CLIProxyAPI-freetier2api-plugin"
 
 	providerKey           = core.ProviderKey
 	managementRoutePrefix = "/plugins/" + pluginID

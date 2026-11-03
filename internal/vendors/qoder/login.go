@@ -40,9 +40,10 @@ const (
 
 // pendingLogin 是一次进行中的登录会话数据（TTL / 节流由 auth 会话表统一管理）。
 type pendingLogin struct {
-	nonce    string
-	verifier string
-	region   Region
+	nonce       string
+	verifier    string
+	region      Region
+	vpcEndpoint string
 }
 
 // LoginProfile 是账号信息（取不到时保持零值）。
@@ -54,7 +55,15 @@ type LoginProfile struct {
 }
 
 // LoginStart 生成 PKCE 参数与登录 URL，并登记一个待轮询的登录会话。
-func LoginStart(ctx context.Context, logins core.LoginSessions, region Region) (loginURL, state string, expiresAt time.Time, err error) {
+func LoginStart(ctx context.Context, logins core.LoginSessions, region Region, vpcEndpoint ...string) (loginURL, state string, expiresAt time.Time, err error) {
+	host, errEndpoint := normalizeVPCEndpoint(firstVPCEndpoint(vpcEndpoint))
+	if errEndpoint != nil {
+		return "", "", time.Time{}, errEndpoint
+	}
+	endpoints, errEndpoint := resolveEndpoints(region, host)
+	if errEndpoint != nil {
+		return "", "", time.Time{}, errEndpoint
+	}
 	verifier, challenge, errPKCE := core.NewPKCEPair()
 	if errPKCE != nil {
 		return "", "", time.Time{}, errPKCE
@@ -62,7 +71,6 @@ func LoginStart(ctx context.Context, logins core.LoginSessions, region Region) (
 	nonce := core.RandomHex(16)
 	state = core.RandomHex(16)
 
-	endpoints := GetEndpoints(region)
 	params := url.Values{}
 	params.Set("nonce", nonce)
 	params.Set("challenge", challenge)
@@ -72,9 +80,10 @@ func LoginStart(ctx context.Context, logins core.LoginSessions, region Region) (
 
 	deadline := time.Now().Add(loginFlowTTL)
 	logins.Register(VendorIDFor(region), state, time.Until(deadline), loginPollInterval, &pendingLogin{
-		nonce:    nonce,
-		verifier: verifier,
-		region:   region,
+		nonce:       nonce,
+		verifier:    verifier,
+		region:      region,
+		vpcEndpoint: host,
 	})
 	return loginURL, state, deadline, nil
 }
@@ -88,7 +97,8 @@ type LoginPollResult struct {
 	RefreshToken string
 	Profile      LoginProfile
 	// Region 是本次登录的区域（取凭证时要用它拼落盘内容）。
-	Region Region
+	Region      Region
+	VPCEndpoint string
 }
 
 // LoginPoll 轮询一次登录会话。
@@ -118,13 +128,14 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, state string) (Lo
 		return LoginPollResult{Pending: true}, nil
 	}
 
-	profile := fetchLoginProfile(ctx, token, entry.region)
+	profile := fetchLoginProfile(ctx, token, entry.region, entry.vpcEndpoint)
 	logins.Delete(state)
 	return LoginPollResult{
 		Token:        token,
 		RefreshToken: refreshToken,
 		Profile:      profile,
 		Region:       entry.region,
+		VPCEndpoint:  entry.vpcEndpoint,
 	}, nil
 }
 
@@ -138,7 +149,10 @@ func OwnsLoginSession(logins core.LoginSessions, sessionID string) bool {
 //
 // waiting=true 表示用户尚未授权（上游 404），调用方应继续等待。
 func pollDeviceToken(ctx context.Context, entry *pendingLogin) (token, refreshToken string, waiting bool, err error) {
-	endpoints := GetEndpoints(entry.region)
+	endpoints, errEndpoints := resolveEndpoints(entry.region, entry.vpcEndpoint)
+	if errEndpoints != nil {
+		return "", "", false, errEndpoints
+	}
 	pollURL := fmt.Sprintf("%s?nonce=%s&verifier=%s&challenge_method=S256",
 		endpoints.PollEndpoint, url.QueryEscape(entry.nonce), url.QueryEscape(entry.verifier))
 	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, pollURL, nil)
@@ -178,8 +192,11 @@ func pollDeviceToken(ctx context.Context, entry *pendingLogin) (token, refreshTo
 }
 
 // fetchLoginProfile 取账号信息（失败只降级：没有 email/name 也能用）。
-func fetchLoginProfile(ctx context.Context, token string, region Region) LoginProfile {
-	endpoints := GetEndpoints(region)
+func fetchLoginProfile(ctx context.Context, token string, region Region, vpcEndpoint ...string) LoginProfile {
+	endpoints, errEndpoints := resolveEndpoints(region, firstVPCEndpoint(vpcEndpoint))
+	if errEndpoints != nil {
+		return LoginProfile{}
+	}
 	result, errProfile := httpGetBearerJSON(ctx, endpoints.UserinfoBase, token)
 	if errProfile != nil {
 		return LoginProfile{}
@@ -193,8 +210,11 @@ func fetchLoginProfile(ctx context.Context, token string, region Region) LoginPr
 }
 
 // FetchPlanName 取套餐名（失败留空）。
-func FetchPlanName(ctx context.Context, token string, region Region) string {
-	endpoints := GetEndpoints(region)
+func FetchPlanName(ctx context.Context, token string, region Region, vpcEndpoint ...string) string {
+	endpoints, errEndpoints := resolveEndpoints(region, firstVPCEndpoint(vpcEndpoint))
+	if errEndpoints != nil {
+		return ""
+	}
 	result, errPlan := httpGetBearerJSON(ctx, endpoints.PlanEndpoint, token)
 	if errPlan != nil {
 		return ""
@@ -205,7 +225,7 @@ func FetchPlanName(ctx context.Context, token string, region Region) string {
 // BuildLoginStorage 生成落盘用的凭证 JSON（扁平格式）。
 //
 // 与导入路径同构：刷新时代码（auth.refresh）能原样读回这些字段。
-func BuildLoginStorage(region Region, token, refreshToken string, profile LoginProfile, plan string, identity MachineIdentity) ([]byte, *Credential) {
+func BuildLoginStorage(region Region, token, refreshToken string, profile LoginProfile, plan string, identity MachineIdentity, vpcEndpoint ...string) ([]byte, *Credential) {
 	payload := map[string]any{
 		"device_token": token,
 		"region":       string(region),
@@ -214,9 +234,16 @@ func BuildLoginStorage(region Region, token, refreshToken string, profile LoginP
 	if refreshToken != "" {
 		payload["refresh_token"] = refreshToken
 	}
+	host := firstVPCEndpoint(vpcEndpoint)
+	if host != "" {
+		payload["vpc_endpoint"] = host
+	}
 	label := profile.Name
 	if label == "" {
 		label = profile.Email
+	}
+	if host != "" {
+		label += " (" + host + ")"
 	}
 	if label != "" {
 		payload["label"] = label
@@ -252,6 +279,7 @@ func BuildLoginStorage(region Region, token, refreshToken string, profile LoginP
 		Token:        token,
 		RefreshToken: refreshToken,
 		Region:       region,
+		VPCEndpoint:  host,
 		Label:        label,
 		Email:        profile.Email,
 		MachineToken: identity.Token,
@@ -321,10 +349,17 @@ func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool
 	if cred == nil {
 		return nil, false, fmt.Errorf("credential is nil")
 	}
+	endpoints, errEndpoints := resolveEndpoints(cred.Region, cred.VPCEndpoint)
+	if errEndpoints != nil {
+		return nil, false, errEndpoints
+	}
 	deviceToken, refreshToken := ParseOAuthSecret(cred.Token)
 	if strings.HasPrefix(deviceToken, "dt-") {
 		// 设备令牌：用 userinfo 保活，内容不变。
-		if _, errInfo := FetchUserInfoWithToken(ctx, deviceToken, cred.Region); errInfo != nil {
+		if cred.VPCEndpoint != "" && cred.RefreshToken != "" {
+			return refreshVPCDeviceToken(ctx, cred, endpoints)
+		}
+		if _, errInfo := FetchUserInfoWithToken(ctx, deviceToken, cred.Region, cred.VPCEndpoint); errInfo != nil {
 			return nil, false, ClassifyCredentialError(errInfo)
 		}
 		return cred, false, nil
@@ -332,7 +367,6 @@ func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool
 
 	// PAT：换 jobToken 拿新的 securityOauthToken / refreshToken。
 	seed := FingerprintSeed("", cred.Token)
-	endpoints := GetEndpoints(cred.Region)
 	jobToken, errExchange := ExchangeJobToken(ctx, cred.Token,
 		DeriveMachineID(seed), DeriveMachineToken(seed), DeriveMachineType(seed),
 		endpoints.JobTokenURL)
@@ -356,6 +390,7 @@ func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool
 		Token:        oauthToken,
 		RefreshToken: nextRefresh,
 		Region:       cred.Region,
+		VPCEndpoint:  cred.VPCEndpoint,
 		Label:        cred.Label,
 		Email:        cred.Email,
 		// 设备身份必须跟着续期走：它是账号能看见国际版活动的前提，
@@ -365,4 +400,46 @@ func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool
 		MachineCode:  cred.MachineCode,
 	}
 	return updated, true, nil
+}
+
+// refreshVPCDeviceToken keeps rotating device credentials on the same instance.
+func refreshVPCDeviceToken(ctx context.Context, cred *Credential, endpoints Endpoints) (*Credential, bool, error) {
+	body, err := json.Marshal(map[string]string{"refresh_token": cred.RefreshToken})
+	if err != nil {
+		return nil, false, err
+	}
+	endpoint := strings.TrimSuffix(endpoints.PollEndpoint, "/poll") + "/refresh"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := hostbridge.Client(ctx, loginHTTPTimeout).Do(req)
+	if err != nil {
+		return nil, false, err
+	}
+	defer resp.Body.Close()
+	raw, err := readQoderResponseBody(resp.Body)
+	if err != nil {
+		return nil, false, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, false, NewError("qoder_refresh_failed", fmt.Sprintf("企业 Token 续期失败（HTTP %d），请重试或重新登录", resp.StatusCode), resp.StatusCode)
+	}
+	var result struct {
+		Token        string `json:"device_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, false, fmt.Errorf("企业 Token 续期响应无效")
+	}
+	if strings.TrimSpace(result.Token) == "" {
+		return nil, false, fmt.Errorf("企业 Token 续期响应缺少 device_token")
+	}
+	updated := *cred
+	updated.Token = result.Token
+	if strings.TrimSpace(result.RefreshToken) != "" {
+		updated.RefreshToken = result.RefreshToken
+	}
+	return &updated, updated.Token != cred.Token || updated.RefreshToken != cred.RefreshToken, nil
 }

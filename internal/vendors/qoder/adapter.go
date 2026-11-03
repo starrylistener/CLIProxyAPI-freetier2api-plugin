@@ -312,8 +312,16 @@ func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 // ---- 登录与续期 ----
 
 // LoginStart 发起一次 PKCE 设备授权登录。
-func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
-	loginURL, state, expiresAt, errStart := LoginStart(ctx, v.Env.Logins, v.region)
+func (v *adapter) LoginStart(ctx context.Context, metadata map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
+	var vpcEndpoint string
+	if raw, exists := metadata["vpc_endpoint"]; exists {
+		var okString bool
+		vpcEndpoint, okString = raw.(string)
+		if !okString {
+			return nil, fmt.Errorf("vpc_endpoint must be a string")
+		}
+	}
+	loginURL, state, expiresAt, errStart := LoginStart(ctx, v.Env.Logins, v.region, vpcEndpoint)
 	if errStart != nil {
 		return nil, errStart
 	}
@@ -341,12 +349,16 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 	if result.Pending {
 		return &pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending}, nil
 	}
-	plan := FetchPlanName(ctx, result.Token, result.Region)
+	plan := FetchPlanName(ctx, result.Token, result.Region, result.VPCEndpoint)
 	// 设备身份：登录这台机器上若装过官方客户端，直接把 runtime-info 签发的
 	// machineToken/machineType 写进凭证——国际版活动按它精确校验，缺了就只能
 	// 看到「无可用签到活动」。
-	storage, cred := BuildLoginStorage(result.Region, result.Token, result.RefreshToken, result.Profile, plan, v.localMachineIdentity())
+	storage, cred := BuildLoginStorage(result.Region, result.Token, result.RefreshToken, result.Profile, plan, v.localMachineIdentity(), result.VPCEndpoint)
 	authID := LoginAuthID(result.Profile, state)
+	if result.VPCEndpoint != "" {
+		// The same person may have public and multiple enterprise accounts.
+		authID += "-" + strings.TrimSuffix(result.VPCEndpoint, vpcDomainSuffix)
+	}
 	fileName := core.FileNameFor(v.ID(), strings.TrimPrefix(authID, "qoder-"))
 	logger.Info("qoder 登录完成（供应商=%s 邮箱=%s）", v.ID(), cred.Email)
 	return &pluginapi.AuthLoginPollResponse{
@@ -431,7 +443,7 @@ func (v *adapter) bridgeFor(ctx context.Context, cred *Credential) (*Bridge, err
 	if errTemplate != nil {
 		return nil, errTemplate
 	}
-	b, errBridge := NewBridge(createCtx, BridgeSecret(cred), v.region, templateBase, &v.models)
+	b, errBridge := NewBridge(createCtx, BridgeSecret(cred), v.region, templateBase, &v.models, cred.VPCEndpoint)
 	if errBridge != nil {
 		return nil, ClassifyCredentialError(errBridge)
 	}

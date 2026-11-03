@@ -1,10 +1,9 @@
 name: CI
 
-# main 分支提交与 PR 仅运行轻量测试门禁（ubuntu 单机环境，1~2 分钟）；
-# 打 v* tag（或手动 workflow_dispatch）时额外触发 5 平台多架构编译，并在 tag 时发布 Release。
+# VPC 分支及手动运行会生成三个平台的安装包；仅 tag 发布 Release。
 on:
   push:
-    branches: [main]
+    branches: [main, feat/qoder-vpc]
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -50,7 +49,7 @@ jobs:
         run: go test ./... -count=1 -timeout 300s
 
       - name: race tests
-        run: go test -race ./internal/core ./internal/state ./internal/auth ./internal/tasks ./internal/admin -count=1
+        run: go test -race ./internal/core ./internal/state ./internal/auth ./internal/tasks ./internal/admin ./internal/vendors/qoder -count=1
 
       - name: 编译 live 探针
         run: go test -tags live ./tests/live -run '^$' -count=1
@@ -61,8 +60,8 @@ jobs:
   build:
     name: 构建 ${{ matrix.goos }}/${{ matrix.goarch }}
     needs: test
-    # 仅在推送 v* tag 或手动触发时才执行多平台重型构建，避免日常 PR/commit 消耗 Windows runner 配额
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    # VPC 开发分支自动产包，其他分支仅在 tag 或手动运行时执行多平台构建。
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/feat/qoder-vpc'
     runs-on: ${{ matrix.os }}
     # 三个平台全部是必选：任一失败即不发版（不再有「尽力而为」的档位）。
     # macOS 已下线（GitHub 跑位抢占不可控，v0.1.40/v0.1.41 因此卡过发版）。
@@ -100,7 +99,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CC: ${{ matrix.cc }}
-          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('0.1.47-vpc.{0}', github.run_number) }}
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -111,11 +110,10 @@ jobs:
 
       # 插件商店安装要求归档名 {id}_{version}_{goos}_{goarch}.zip，
       # 且 zip 根目录下只能有 {id}{ext} 一个动态库；见 scripts/packstore。
-      - name: 打包插件商店归档（仅 tag）
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: 打包插件安装归档
         shell: bash
         env:
-          VERSION_TAG: ${{ github.ref_name }}
+          VERSION_TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('0.1.47-vpc.{0}', github.run_number) }}
         run: |
           set -euo pipefail
           # 归档名里的版本号是 tag 去掉前导 v（宿主按同样规则从 tag 推导）。
@@ -127,13 +125,35 @@ jobs:
             -goarch ${{ matrix.goarch }} \
             -out-dir dist
 
-      # 只发布商店归档：裸动态库不再单独上传（手动安装者解压 zip 即可）。
-      # 非 tag 运行没有 zip，因此这里必须限定在 tag 上，否则 if-no-files-found 会让构建失败。
+      # 所有构建都上传可安装的 zip，手动运行不再只有裸库且无产物。
       - uses: actions/upload-artifact@v4
-        if: startsWith(github.ref, 'refs/tags/v')
         with:
           name: freetier-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/freetier_*_${{ matrix.goos }}_${{ matrix.goarch }}.zip
+          if-no-files-found: error
+
+  package:
+    name: 汇总安装包与校验和
+    needs: build
+    if: success() && !startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: freetier-*
+          path: assets
+          merge-multiple: true
+      - name: 生成校验和
+        run: go run ./scripts/packstore -checksums-dir assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freetier-vpc-packages
+          path: assets/*
           if-no-files-found: error
 
   release:

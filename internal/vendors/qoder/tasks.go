@@ -48,12 +48,14 @@ type Quota struct {
 
 // FetchQuota 查询账号额度。
 func FetchQuota(ctx context.Context, cred *Credential) (*Quota, error) {
+	endpoints, errEndpoints := resolveEndpoints(cred.Region, cred.VPCEndpoint)
+	if errEndpoints != nil {
+		return nil, errEndpoints
+	}
 	bearer, errToken := quotaBearerToken(ctx, cred)
 	if errToken != nil {
 		return nil, errToken
 	}
-	endpoints := GetEndpoints(cred.Region)
-
 	raw, errQuota := httpGetBearerJSON(ctx, endpoints.QuotaEndpoint, bearer)
 	if errQuota != nil {
 		return nil, errQuota
@@ -217,12 +219,15 @@ func firstNumberField(object map[string]any, keys ...string) (float64, bool) {
 // 设备令牌（dt-…）可直接用；PAT（pt-…）必须先经 jobToken 交换拿到
 // securityOauthToken——上游额度接口不认 PAT 本身。
 func quotaBearerToken(ctx context.Context, cred *Credential) (string, error) {
+	endpoints, errEndpoints := resolveEndpoints(cred.Region, cred.VPCEndpoint)
+	if errEndpoints != nil {
+		return "", errEndpoints
+	}
 	deviceToken, _ := ParseOAuthSecret(cred.Token)
 	if strings.HasPrefix(deviceToken, "dt-") {
 		return deviceToken, nil
 	}
 	seed := FingerprintSeed("", cred.Token)
-	endpoints := GetEndpoints(cred.Region)
 	jobToken, errExchange := ExchangeJobToken(ctx, cred.Token,
 		DeriveMachineID(seed), DeriveMachineToken(seed), DeriveMachineType(seed),
 		endpoints.JobTokenURL)
@@ -585,6 +590,9 @@ type dailyCheckinStatus struct {
 // （见 checkinHeaders）。国内版不需要身份；国际版没有身份就看不到活动，
 // 此时结果会说明原因而不是笼统报「无可用签到活动」。
 func Checkin(ctx context.Context, cred *Credential, identity MachineIdentity) (*CheckinResult, error) {
+	if cred.VPCEndpoint != "" {
+		return &CheckinResult{Status: CheckinNoCampaign, NotRecorded: true, Message: "企业专属账号暂不支持签到"}, nil
+	}
 	result := &CheckinResult{Status: CheckinError}
 	bearer := checkinBearer(cred.Token)
 	if bearer == "" {
