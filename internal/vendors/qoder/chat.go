@@ -324,7 +324,7 @@ func BuildQoderMessages(templateMsgs []interface{}, incoming []interface{}, prom
 
 	hasIncomingSystem := false
 	for _, m := range incoming {
-		if mm, ok := m.(map[string]interface{}); ok && mm["role"] == "system" {
+		if mm, ok := m.(map[string]interface{}); ok && (mm["role"] == "system" || mm["role"] == "developer") {
 			hasIncomingSystem = true
 			break
 		}
@@ -389,6 +389,10 @@ func BuildQoderMessages(templateMsgs []interface{}, incoming []interface{}, prom
 
 func ConvertIncomingMessage(msg map[string]interface{}, toolsEnabled bool) map[string]interface{} {
 	role, _ := msg["role"].(string)
+	// Qoder 不接受 developer 角色；按原消息位置转为 system，保留调用方指令。
+	if role == "developer" {
+		role = "system"
+	}
 	content := msg["content"]
 
 	// Handle Claude Messages API content blocks (array of typed blocks)
